@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Network security configuration.
+    Allows cleartext (unencrypted) traffic to private/LAN IP ranges
+    so the app can communicate with Minecraft servers on the local network.
+    HTTPS is enforced for all other destinations.
+-->
+<network-security-config>
+    <!-- Allow cleartext to local network ranges (LAN servers) -->
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- Private IPv4 ranges -->
+        <domain includeSubdomains="true">10.0.0.0/8</domain>
+        <domain includeSubdomains="true">172.16.0.0/12</domain>
+        <domain includeSubdomains="true">192.168.0.0/16</domain>
+        <!-- Loopback (proxy) -->
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+
+    <!-- Default: enforce HTTPS for all other traffic -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
