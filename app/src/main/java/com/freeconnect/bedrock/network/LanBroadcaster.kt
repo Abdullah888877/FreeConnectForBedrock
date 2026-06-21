@@ -49,11 +49,12 @@ class LanBroadcaster @Inject constructor() {
         /**
          * Bedrock protocol version.
          * Update this constant whenever a new Bedrock release ships.
-         * 748 = 1.21.50 | 729 = 1.21.40 | 712 = 1.21.30 | 685 = 1.21.20
-         * Check wiki.vg/Bedrock_Protocol for the latest mapping.
+         * Known mappings: 748 = 1.21.50 | 729 = 1.21.40 | 712 = 1.21.30
+         * 1.26.0 estimated protocol — update if client shows "Outdated Server".
+         * Check wiki.vg/Bedrock_Protocol for the authoritative mapping.
          */
-        private const val PROTOCOL_VERSION = 748
-        private const val GAME_VERSION = "1.21.50"
+        private const val PROTOCOL_VERSION = 980
+        private const val GAME_VERSION = "1.26.0"
 
         /** Maximum broadcast attempts before giving up on socket errors */
         private const val MAX_SOCKET_ERRORS = 5
