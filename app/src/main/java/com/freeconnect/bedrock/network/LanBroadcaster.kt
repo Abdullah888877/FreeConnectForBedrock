@@ -46,9 +46,14 @@ class LanBroadcaster @Inject constructor() {
         /** Broadcast interval in milliseconds */
         private const val BROADCAST_INTERVAL_MS = 1500L
 
-        /** Bedrock protocol version (1.21.x) */
-        private const val PROTOCOL_VERSION = 662
-        private const val GAME_VERSION = "1.21.0"
+        /**
+         * Bedrock protocol version.
+         * Update this constant whenever a new Bedrock release ships.
+         * 748 = 1.21.50 | 729 = 1.21.40 | 712 = 1.21.30 | 685 = 1.21.20
+         * Check wiki.vg/Bedrock_Protocol for the latest mapping.
+         */
+        private const val PROTOCOL_VERSION = 748
+        private const val GAME_VERSION = "1.21.50"
 
         /** Maximum broadcast attempts before giving up on socket errors */
         private const val MAX_SOCKET_ERRORS = 5
