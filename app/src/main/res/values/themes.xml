@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Base theme — a minimal Material3 theme.
+        Actual theming (colors, typography) is handled entirely in Compose
+        via FreeConnectTheme in ui/theme/Theme.kt.
+        This XML theme is required only for the Activity window background
+        and status bar behaviour before Compose takes over.
+    -->
+    <style name="Theme.FreeConnectForBedrock" parent="android:Theme.Material.NoActionBar">
+        <!-- Dark status bar icons on light window, Compose overrides the actual color -->
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
