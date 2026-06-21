@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Adaptive launcher icon foreground — replace with your custom artwork.
+    For a production release, provide proper PNG assets in each density bucket
+    or use an adaptive icon XML pointing to a vector drawable.
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
