@@ -251,7 +251,7 @@ private fun ProxyControlCard(
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    imageVector = if (isRunning) Icons.Default.Router else Icons.Default.RouterOutlined,
+                    imageVector = if (isRunning) Icons.Default.Router else Icons.Default.Router,
                     contentDescription = null,
                     tint = if (isRunning) MaterialTheme.colorScheme.primary
                            else MaterialTheme.colorScheme.onSurfaceVariant
