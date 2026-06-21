@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FreeConnect for Bedrock</string>
+    <string name="home_title">FreeConnect</string>
+    <string name="home_subtitle">Bedrock Edition</string>
+    <string name="add_server">Add Server</string>
+    <string name="edit_server">Edit Server</string>
+    <string name="server_name">Server Name</string>
+    <string name="ip_address">IP Address</string>
+    <string name="port">Port</string>
+    <string name="save">Save</string>
+    <string name="connect">Connect</string>
+    <string name="delete">Delete</string>
+    <string name="settings">Settings</string>
+    <string name="dark_mode">Dark Mode</string>
+    <string name="broadcast">Broadcast</string>
+    <string name="stop_broadcast">Stop Broadcast</string>
+    <string name="resource_packs">Resource Packs</string>
+    <string name="import_pack">Import Pack</string>
+    <string name="no_servers">No servers yet</string>
+    <string name="lan_broadcast_channel_name">LAN Broadcast</string>
+    <string name="lan_broadcast_channel_desc">Shows while FreeConnect is broadcasting a server on your local network</string>
+    <string name="notification_broadcasting">Broadcasting on LAN</string>
+    <string name="notification_stop">Stop</string>
+</resources>
