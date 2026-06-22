@@ -77,12 +77,12 @@ class LanBroadcaster @Inject constructor(
         )
 
         /**
-         * Bedrock protocol number for 1.26.30 (estimated).
-         * Known anchors: 748 = 1.21.50.
-         * Update when the exact number for 1.26.30 is confirmed on wiki.vg.
+         * Bedrock protocol number for 1.26.31.
+         * Patch releases (x.y.z → x.y.z+1) share the same protocol number.
+         * Update PROTOCOL_VERSION when a new minor/major release ships.
          */
         private const val PROTOCOL_VERSION = 1026
-        private const val GAME_VERSION     = "1.26.30"
+        private const val GAME_VERSION     = "1.26.31"
 
         private const val MAX_PACKET = 65536
     }
