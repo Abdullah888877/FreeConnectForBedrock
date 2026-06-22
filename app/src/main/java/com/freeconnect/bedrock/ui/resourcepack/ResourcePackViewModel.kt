@@ -5,14 +5,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.freeconnect.bedrock.data.resourcepack.LocalResourcePack
 import com.freeconnect.bedrock.data.resourcepack.ResourcePackRepository
-import com.freeconnect.bedrock.network.ResourcePackProxy
 import dagger.hilt.android.lifecycle.HiltViewModel
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -20,32 +17,18 @@ import javax.inject.Inject
 /**
  * ViewModel for the Resource Pack screen.
  *
- * Manages:
- *  - Listing and importing resource packs
- *  - Enabling/disabling packs for injection
- *  - Starting/stopping the UDP proxy that injects packs into a server session
+ * Manages importing, enabling/disabling, and deleting locally stored packs.
+ * Enabled packs are automatically served to consoles when LAN Broadcast is
+ * active — no proxy or manual step needed.
  */
 @HiltViewModel
 class ResourcePackViewModel @Inject constructor(
-    private val repository: ResourcePackRepository,
-    private val proxy: ResourcePackProxy
+    private val repository: ResourcePackRepository
 ) : ViewModel() {
-
-    // ── Pack list ─────────────────────────────────────────────────────────────
 
     /** All locally stored packs. */
     val packs: StateFlow<List<LocalResourcePack>> = repository.allPacks
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-
-    // ── Proxy state ───────────────────────────────────────────────────────────
-
-    private val _proxyStatus = MutableStateFlow("Proxy stopped")
-    val proxyStatus: StateFlow<String> = _proxyStatus.asStateFlow()
-
-    private val _isProxyRunning = MutableStateFlow(false)
-    val isProxyRunning: StateFlow<Boolean> = _isProxyRunning.asStateFlow()
-
-    private var proxyJob: Job? = null
 
     // ── Import state ──────────────────────────────────────────────────────────
 
@@ -54,15 +37,6 @@ class ResourcePackViewModel @Inject constructor(
 
     private val _isImporting = MutableStateFlow(false)
     val isImporting: StateFlow<Boolean> = _isImporting.asStateFlow()
-
-    // ── Server context (set when navigating from a specific server) ───────────
-    private var targetServerIp: String = ""
-    private var targetServerPort: Int  = 19132
-
-    fun setServerTarget(ip: String, port: Int) {
-        targetServerIp   = ip
-        targetServerPort = port
-    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Import
@@ -94,56 +68,8 @@ class ResourcePackViewModel @Inject constructor(
     }
 
     fun deletePack(pack: LocalResourcePack) {
-        viewModelScope.launch {
-            if (_isProxyRunning.value) stopProxy()
-            repository.deletePack(pack)
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Proxy control
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Start the resource-pack proxy for [targetServerIp]:[targetServerPort].
-     * The proxy intercepts the server's pack list and prepends all enabled
-     * local packs so the Minecraft client downloads them automatically.
-     *
-     * Tell the user to connect Minecraft to 127.0.0.1:19135 instead of the
-     * real server address.
-     */
-    fun startProxy() {
-        if (_isProxyRunning.value) return
-        viewModelScope.launch {
-            val enabledPacks = repository.enabledPacks.first()
-            proxy.configure(packs = enabledPacks, enabled = true)
-
-            _isProxyRunning.value = true
-            _proxyStatus.value = "Starting proxy…"
-
-            proxyJob = launch {
-                proxy.runProxy(
-                    remoteHost = targetServerIp,
-                    remotePort = targetServerPort,
-                    onStatus   = { status -> _proxyStatus.value = status }
-                )
-            }
-        }
-    }
-
-    /** Stop the proxy and clean up. */
-    fun stopProxy() {
-        proxyJob?.cancel()
-        proxyJob = null
-        _isProxyRunning.value  = false
-        _proxyStatus.value     = "Proxy stopped"
-        proxy.configure(emptyList(), false)
+        viewModelScope.launch { repository.deletePack(pack) }
     }
 
     fun clearImportStatus() { _importStatus.value = null }
-
-    override fun onCleared() {
-        super.onCleared()
-        stopProxy()
-    }
 }
