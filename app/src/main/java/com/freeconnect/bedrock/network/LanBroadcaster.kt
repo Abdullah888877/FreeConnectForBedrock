@@ -46,9 +46,9 @@ class LanBroadcaster @Inject constructor() {
             0x12, 0x34, 0x56, 0x78
         )
 
-        /** Bedrock protocol version (1.21.x) */
-        private const val PROTOCOL_VERSION = 662
-        private const val GAME_VERSION = "1.21.0"
+        /** Bedrock protocol version (1.26.x) */
+        private const val PROTOCOL_VERSION = 975
+        private const val GAME_VERSION = "1.26.20"
 
         /** RakNet packet IDs */
         private const val ID_UNCONNECTED_PING: Byte      = 0x01
