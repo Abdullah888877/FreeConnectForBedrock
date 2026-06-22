@@ -19,18 +19,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
-import com.freeconnect.bedrock.data.db.ServerEntity
 import com.freeconnect.bedrock.data.resourcepack.LocalResourcePack
-import com.freeconnect.bedrock.network.ResourcePackProxy
 
 /**
  * Resource Pack management screen.
  *
- * Features:
- *  - Import .mcpack files from device storage
- *  - Enable/disable individual packs for injection
- *  - Start/stop the local UDP proxy (connect Minecraft to 127.0.0.1:19135)
- *  - Delete packs from local storage
+ * Lets you import, enable/disable, and delete locally stored .mcpack files.
+ * Enabled packs are automatically downloaded by consoles (Xbox / PS5 / Switch)
+ * when they join via the LAN tab — no proxy or manual IP entry needed.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -39,11 +35,9 @@ fun ResourcePackScreen(
     onNavigateBack: () -> Unit,
     viewModel: ResourcePackViewModel = hiltViewModel()
 ) {
-    val packs         by viewModel.packs.collectAsState()
-    val proxyStatus   by viewModel.proxyStatus.collectAsState()
-    val isProxyRunning by viewModel.isProxyRunning.collectAsState()
-    val importStatus  by viewModel.importStatus.collectAsState()
-    val isImporting   by viewModel.isImporting.collectAsState()
+    val packs        by viewModel.packs.collectAsState()
+    val importStatus by viewModel.importStatus.collectAsState()
+    val isImporting  by viewModel.isImporting.collectAsState()
 
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -54,7 +48,6 @@ fun ResourcePackScreen(
         }
     }
 
-    // File picker for .mcpack import
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -75,7 +68,6 @@ fun ResourcePackScreen(
                     }
                 },
                 actions = {
-                    // Import button
                     IconButton(
                         onClick = {
                             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -105,20 +97,9 @@ fun ResourcePackScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
 
-            // ── Proxy control card ────────────────────────────────────────────
+            // ── How packs work with LAN ───────────────────────────────────────
             item {
-                ProxyControlCard(
-                    status         = proxyStatus,
-                    isRunning      = isProxyRunning,
-                    proxyPort      = ResourcePackProxy.LOCAL_PROXY_PORT,
-                    onStart        = { viewModel.startProxy() },
-                    onStop         = { viewModel.stopProxy() }
-                )
-            }
-
-            // ── How-to card ───────────────────────────────────────────────────
-            item {
-                HowToCard()
+                HowItWorksCard()
             }
 
             // ── Import loading indicator ──────────────────────────────────────
@@ -139,7 +120,9 @@ fun ResourcePackScreen(
             // ── Pack list header ──────────────────────────────────────────────
             item {
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
@@ -149,13 +132,13 @@ fun ResourcePackScreen(
                         modifier = Modifier.weight(1f)
                     )
                     val enabledCount = packs.count { it.isEnabled }
-                    if (enabledCount > 0) {
+                    AnimatedVisibility(visible = enabledCount > 0) {
                         Surface(
                             shape = MaterialTheme.shapes.small,
                             color = MaterialTheme.colorScheme.primaryContainer
                         ) {
                             Text(
-                                text = "$enabledCount active",
+                                text = "$enabledCount enabled",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
@@ -169,7 +152,9 @@ fun ResourcePackScreen(
             if (packs.isEmpty()) {
                 item {
                     Box(
-                        modifier = Modifier.fillMaxWidth().padding(32.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(32.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -186,7 +171,7 @@ fun ResourcePackScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Text(
-                                text = "Tap + to import a .mcpack file",
+                                text = "Tap + above to import a .mcpack file",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -198,9 +183,9 @@ fun ResourcePackScreen(
             // ── Pack cards ────────────────────────────────────────────────────
             items(packs, key = { it.id }) { pack ->
                 ResourcePackCard(
-                    pack      = pack,
-                    onToggle  = { viewModel.togglePackEnabled(pack) },
-                    onDelete  = { packToDelete = pack }
+                    pack     = pack,
+                    onToggle = { viewModel.togglePackEnabled(pack) },
+                    onDelete = { packToDelete = pack }
                 )
             }
 
@@ -208,7 +193,6 @@ fun ResourcePackScreen(
         }
     }
 
-    // Delete confirmation
     packToDelete?.let { pack ->
         AlertDialog(
             onDismissRequest = { packToDelete = null },
@@ -232,118 +216,41 @@ fun ResourcePackScreen(
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun ProxyControlCard(
-    status: String,
-    isRunning: Boolean,
-    proxyPort: Int,
-    onStart: () -> Unit,
-    onStop: () -> Unit
-) {
+private fun HowItWorksCard() {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = if (isRunning)
-                MaterialTheme.colorScheme.primaryContainer
-            else
-                MaterialTheme.colorScheme.surfaceVariant
+            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f)
         )
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    imageVector = if (isRunning) Icons.Default.Router else Icons.Default.Router,
+                    imageVector = Icons.Default.Wifi,
                     contentDescription = null,
-                    tint = if (isRunning) MaterialTheme.colorScheme.primary
-                           else MaterialTheme.colorScheme.onSurfaceVariant
+                    tint = MaterialTheme.colorScheme.secondary
                 )
-                Spacer(modifier = Modifier.width(12.dp))
-                Column {
-                    Text(
-                        text = "Pack Injection Proxy",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Text(
-                        text = status,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            AnimatedVisibility(visible = isRunning) {
-                Column(modifier = Modifier.padding(top = 12.dp)) {
-                    HorizontalDivider()
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Connect Minecraft to:",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = "127.0.0.1 : $proxyPort",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Text(
-                        text = "instead of the real server address",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Button(
-                onClick = if (isRunning) onStop else onStart,
-                modifier = Modifier.fillMaxWidth(),
-                colors = if (isRunning)
-                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                else
-                    ButtonDefaults.buttonColors()
-            ) {
-                Icon(
-                    imageVector = if (isRunning) Icons.Default.Stop else Icons.Default.PlayArrow,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "How packs work for consoles",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
                 )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(if (isRunning) "Stop Proxy" else "Start Proxy")
             }
-        }
-    }
-}
-
-@Composable
-private fun HowToCard() {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
-        )
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = "How to use custom packs",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold
-            )
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(10.dp))
             listOf(
-                "1. Import a .mcpack file using the + button above.",
-                "2. Enable the packs you want to inject.",
-                "3. Tap Start Proxy — the proxy runs locally on this device.",
-                "4. In Minecraft, add a new server using 127.0.0.1 and port 19135.",
-                "5. Connect — your packs will be automatically injected.",
-                "Note: Both this device and the target server must be on the same Wi-Fi."
+                "1. Tap + to import a .mcpack file from your phone.",
+                "2. Toggle the switch to enable the packs you want.",
+                "3. Go back and tap Broadcast on your server card.",
+                "4. On your console, open Minecraft → Play → LAN tab.",
+                "5. Join the server — packs download automatically.",
+                "6. After downloading, you'll be moved to the real server."
             ).forEach { step ->
                 Text(
-                    text = step,
+                    text  = step,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 2.dp)
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.padding(bottom = 3.dp)
                 )
             }
         }
@@ -371,7 +278,6 @@ private fun ResourcePackCard(
                 .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Pack icon
             Surface(
                 shape = MaterialTheme.shapes.small,
                 color = if (pack.isEnabled) MaterialTheme.colorScheme.primaryContainer
@@ -392,17 +298,17 @@ private fun ResourcePackCard(
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text  = pack.name,
-                    style = MaterialTheme.typography.titleSmall,
+                    text      = pack.name,
+                    style     = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    maxLines  = 1,
+                    overflow  = TextOverflow.Ellipsis
                 )
                 if (pack.description.isNotBlank()) {
                     Text(
-                        text  = pack.description,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        text     = pack.description,
+                        style    = MaterialTheme.typography.bodySmall,
+                        color    = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -414,15 +320,13 @@ private fun ResourcePackCard(
                 )
             }
 
-            // Enable toggle
             Switch(
-                checked           = pack.isEnabled,
-                onCheckedChange   = { onToggle() }
+                checked         = pack.isEnabled,
+                onCheckedChange = { onToggle() }
             )
 
             Spacer(modifier = Modifier.width(4.dp))
 
-            // Delete
             IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
                 Icon(
                     Icons.Default.Delete,
@@ -435,7 +339,6 @@ private fun ResourcePackCard(
     }
 }
 
-/** Format bytes to a human-readable string (KB / MB). */
 private fun formatBytes(bytes: Long): String = when {
     bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
     bytes >= 1_024     -> "${bytes / 1_024} KB"
