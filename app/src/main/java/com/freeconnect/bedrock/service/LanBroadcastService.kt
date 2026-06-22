@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -25,16 +26,11 @@ import javax.inject.Inject
 private const val TAG = "LanBroadcastService"
 
 /**
- * Foreground service that runs the Minecraft Bedrock LAN broadcaster AND the
- * connection proxy side-by-side.
- *
- * Flow:
- *   1. [LanBroadcaster] listens on port 19132 for Unconnected Ping packets
- *      from Minecraft and responds with pongs that advertise port 19133.
- *   2. [BedrockProxy] listens on port 19133 and transparently forwards all
- *      UDP traffic between the Minecraft client and the real remote server.
- *
- * Start via [startBroadcast] and stop via [stopBroadcast].
+ * Foreground service that:
+ *   1. Acquires a WifiManager.MulticastLock so Android delivers incoming UDP
+ *      broadcast packets to our socket (critical on Samsung/Xiaomi/Oppo etc.).
+ *   2. Runs LanBroadcaster — dual-mode LAN discovery on port 19132.
+ *   3. Runs BedrockProxy — UDP tunnel on port 19133 to the real remote server.
  */
 @AndroidEntryPoint
 class LanBroadcastService : Service() {
@@ -46,9 +42,13 @@ class LanBroadcastService : Service() {
     private var broadcasterJob: Job? = null
     private var proxyJob: Job? = null
 
+    /** Held while broadcasting; prevents the OS from silently dropping UDP broadcasts. */
+    private var multicastLock: WifiManager.MulticastLock? = null
+
     companion object {
         private const val CHANNEL_ID      = "lan_broadcast_channel"
         private const val NOTIFICATION_ID = 1001
+        private const val MULTICAST_TAG   = "FreeConnect:LAN"
 
         const val EXTRA_SERVER_NAME = "server_name"
         const val EXTRA_SERVER_IP   = "server_ip"
@@ -56,12 +56,13 @@ class LanBroadcastService : Service() {
         const val ACTION_STOP       = "com.freeconnect.bedrock.STOP_BROADCAST"
 
         fun startBroadcast(context: Context, name: String, ip: String, port: Int) {
-            val intent = Intent(context, LanBroadcastService::class.java).apply {
-                putExtra(EXTRA_SERVER_NAME, name)
-                putExtra(EXTRA_SERVER_IP,   ip)
-                putExtra(EXTRA_SERVER_PORT, port)
-            }
-            context.startForegroundService(intent)
+            context.startForegroundService(
+                Intent(context, LanBroadcastService::class.java).apply {
+                    putExtra(EXTRA_SERVER_NAME, name)
+                    putExtra(EXTRA_SERVER_IP,   ip)
+                    putExtra(EXTRA_SERVER_PORT, port)
+                }
+            )
         }
 
         fun stopBroadcast(context: Context) {
@@ -74,13 +75,18 @@ class LanBroadcastService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        // Acquire multicast lock — many Android OEMs silently drop incoming UDP
+        // broadcast packets without this, making LAN discovery impossible.
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        multicastLock = wm.createMulticastLock(MULTICAST_TAG).also {
+            it.setReferenceCounted(true)
+            it.acquire()
+            Log.i(TAG, "MulticastLock acquired")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        if (intent?.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
 
         val serverName = intent?.getStringExtra(EXTRA_SERVER_NAME) ?: "Minecraft Server"
         val serverIp   = intent?.getStringExtra(EXTRA_SERVER_IP)   ?: ""
@@ -88,11 +94,9 @@ class LanBroadcastService : Service() {
 
         startForeground(NOTIFICATION_ID, buildNotification(serverName, serverIp, serverPort))
 
-        // Cancel any previous jobs before starting new ones
         broadcasterJob?.cancel()
         proxyJob?.cancel()
 
-        // 1. Ping listener → advertises BedrockProxy.PROXY_PORT in the MOTD
         broadcasterJob = serviceScope.launch {
             lanBroadcaster.startBroadcasting(
                 serverName  = serverName,
@@ -101,7 +105,6 @@ class LanBroadcastService : Service() {
             )
         }
 
-        // 2. UDP proxy → forwards Minecraft ↔ remote server traffic
         proxyJob = serviceScope.launch {
             bedrockProxy.start(
                 remoteIp   = serverIp,
@@ -110,53 +113,38 @@ class LanBroadcastService : Service() {
             )
         }
 
-        Log.i(TAG, "Service started — broadcasting '$serverName', proxying → $serverIp:$serverPort")
+        Log.i(TAG, "Service started — '${serverName}' ${serverIp}:${serverPort}")
         return START_STICKY
     }
 
     override fun onDestroy() {
         broadcasterJob?.cancel()
         proxyJob?.cancel()
+        multicastLock?.let { if (it.isHeld) { it.release(); Log.i(TAG, "MulticastLock released") } }
         super.onDestroy()
         Log.i(TAG, "Service destroyed")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // -------------------------------------------------------------------------
-    // Notification helpers
-    // -------------------------------------------------------------------------
-
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "LAN Broadcast",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Active while FreeConnect is relaying a server on your LAN"
-            setShowBadge(false)
-        }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val ch = NotificationChannel(CHANNEL_ID, "LAN Broadcast", NotificationManager.IMPORTANCE_LOW)
+            .apply { description = "Active while FreeConnect is relaying a Bedrock server"; setShowBadge(false) }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
     }
 
     private fun buildNotification(name: String, ip: String, port: Int): Notification {
-        val openIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val stopIntent = PendingIntent.getService(
-            this, 1,
+        val openI = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val stopI = PendingIntent.getService(this, 1,
             Intent(this, LanBroadcastService::class.java).apply { action = ACTION_STOP },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Relaying: $name")
-            .setContentText("$ip:$port → LAN port ${BedrockProxy.PROXY_PORT}")
+            .setContentTitle("Broadcasting: ${name}")
+            .setContentText("Relaying ${ip}:${port} → LAN:${BedrockProxy.PROXY_PORT}")
             .setSmallIcon(android.R.drawable.ic_menu_share)
-            .setContentIntent(openIntent)
-            .addAction(android.R.drawable.ic_media_pause, "Stop", stopIntent)
+            .setContentIntent(openI)
+            .addAction(android.R.drawable.ic_media_pause, "Stop", stopI)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
