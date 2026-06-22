@@ -3,6 +3,7 @@ package com.freeconnect.bedrock.ui.resourcepack
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.freeconnect.bedrock.data.repository.ServerRepository
 import com.freeconnect.bedrock.data.resourcepack.LocalResourcePack
 import com.freeconnect.bedrock.data.resourcepack.ResourcePackRepository
 import com.freeconnect.bedrock.network.ResourcePackProxy
@@ -28,6 +29,7 @@ import javax.inject.Inject
 @HiltViewModel
 class ResourcePackViewModel @Inject constructor(
     private val repository: ResourcePackRepository,
+    private val serverRepository: ServerRepository,
     private val proxy: ResourcePackProxy
 ) : ViewModel() {
 
@@ -55,13 +57,22 @@ class ResourcePackViewModel @Inject constructor(
     private val _isImporting = MutableStateFlow(false)
     val isImporting: StateFlow<Boolean> = _isImporting.asStateFlow()
 
-    // ── Server context (set when navigating from a specific server) ───────────
+    // ── Server context ────────────────────────────────────────────────────────
     private var targetServerIp: String = ""
     private var targetServerPort: Int  = 19132
 
-    fun setServerTarget(ip: String, port: Int) {
-        targetServerIp   = ip
-        targetServerPort = port
+    /**
+     * Load the server's IP and port from the database by [serverId].
+     * Must be called before [startProxy] so the proxy knows where to connect.
+     * Called automatically via LaunchedEffect in ResourcePackScreen.
+     */
+    fun loadServerTarget(serverId: Long) {
+        viewModelScope.launch {
+            serverRepository.getServerById(serverId).first()?.let { server ->
+                targetServerIp   = server.ipAddress
+                targetServerPort = server.port
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -105,15 +116,18 @@ class ResourcePackViewModel @Inject constructor(
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Start the resource-pack proxy for [targetServerIp]:[targetServerPort].
+     * Start the resource-pack proxy for the server set via [loadServerTarget].
      * The proxy intercepts the server's pack list and prepends all enabled
      * local packs so the Minecraft client downloads them automatically.
      *
-     * Tell the user to connect Minecraft to 127.0.0.1:19135 instead of the
-     * real server address.
+     * Connect Minecraft to 127.0.0.1:19135 instead of the real server address.
      */
     fun startProxy() {
         if (_isProxyRunning.value) return
+        if (targetServerIp.isBlank()) {
+            _proxyStatus.value = "Error: server address not set"
+            return
+        }
         viewModelScope.launch {
             val enabledPacks = repository.enabledPacks.first()
             proxy.configure(packs = enabledPacks, enabled = true)
