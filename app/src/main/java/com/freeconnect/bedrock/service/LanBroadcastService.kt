@@ -120,6 +120,7 @@ class LanBroadcastService : Service() {
     override fun onDestroy() {
         broadcasterJob?.cancel()
         proxyJob?.cancel()
+        serviceScope.cancel()
         multicastLock?.let { if (it.isHeld) { it.release(); Log.i(TAG, "MulticastLock released") } }
         super.onDestroy()
         Log.i(TAG, "Service destroyed")
