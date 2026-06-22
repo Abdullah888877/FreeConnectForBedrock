@@ -48,6 +48,11 @@ fun ResourcePackScreen(
 
     val snackbarHostState = remember { SnackbarHostState() }
 
+    // Load the server's IP:port so the proxy knows where to connect
+    LaunchedEffect(serverId) {
+        viewModel.loadServerTarget(serverId)
+    }
+
     LaunchedEffect(importStatus) {
         importStatus?.let {
             snackbarHostState.showSnackbar(it)
