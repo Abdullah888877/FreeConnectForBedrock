@@ -326,15 +326,30 @@ class BedrockSession(
         val file = File(pack.filePath); if (!file.exists()) return
         val size   = file.length()
         val chunks = ((size + MAX_CHUNK - 1) / MAX_CHUNK).toInt()
-        sendEncrypted(resourcePackDataInfo(pack.uuid, size, chunks, sha256Hex(file.readBytes())))
+        val hash = MessageDigest.getInstance("SHA-256").run {
+            file.inputStream().use { s ->
+                val buf = ByteArray(65536)
+                var r = s.read(buf)
+                while (r != -1) { update(buf, 0, r); r = s.read(buf) }
+            }
+            digest().joinToString("") { "%02x".format(it) }
+        }
+        sendEncrypted(resourcePackDataInfo(pack.uuid, size, chunks, hash))
     }
 
     private fun sendChunk(pack: LocalResourcePack, idx: Int) {
         val file   = File(pack.filePath); if (!file.exists()) return
         val offset = idx * MAX_CHUNK
-        val slice  = file.inputStream().use { s ->
+        val sliceLen = minOf(MAX_CHUNK, file.length() - offset).toInt()
+        val slice = ByteArray(sliceLen)
+        file.inputStream().use { s ->
             s.skip(offset)
-            s.readNBytes(minOf(MAX_CHUNK, file.length() - offset).toInt())
+            var pos = 0
+            while (pos < sliceLen) {
+                val r = s.read(slice, pos, sliceLen - pos)
+                if (r == -1) break
+                pos += r
+            }
         }
         sendEncrypted(resourcePackChunk(pack.uuid, idx, offset, slice))
         chunksSent[pack.uuid] = (chunksSent[pack.uuid] ?: 0) + 1
