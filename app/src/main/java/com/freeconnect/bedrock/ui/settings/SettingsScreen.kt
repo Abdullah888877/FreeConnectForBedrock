@@ -151,7 +151,7 @@ fun SettingsScreen(
             // ── About ────────────────────────────────────────────────────────
             SettingsSectionHeader("About")
 
-            SettingsInfoRow(title = "Version", value = "1.0.0")
+            SettingsInfoRow(title = "Version", value = "1.5.0")
             SettingsInfoRow(title = "Build", value = "Release")
             SettingsInfoRow(title = "License", value = "Open Source — No Ads, No Subscriptions")
         }
