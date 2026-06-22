@@ -1,86 +1,73 @@
 package com.freeconnect.bedrock.network
 
 import android.util.Log
+import com.freeconnect.bedrock.data.resourcepack.LocalResourcePack
+import com.freeconnect.bedrock.data.resourcepack.ResourcePackRepository
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.zip.Deflater
 import javax.inject.Inject
 import javax.inject.Singleton
 
 private const val TAG = "BedrockLanServer"
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RakNet packet ID constants
-// ─────────────────────────────────────────────────────────────────────────────
-private const val ID_UNCONNECTED_PING: Byte        = 0x01
-private const val ID_UNCONNECTED_PONG: Byte        = 0x1C
+// ── RakNet offline packet IDs ────────────────────────────────────────────────
+private const val ID_UNCONNECTED_PING: Byte          = 0x01
+private const val ID_UNCONNECTED_PONG: Byte          = 0x1C
 private const val ID_OPEN_CONNECTION_REQUEST_1: Byte = 0x05
 private const val ID_OPEN_CONNECTION_REPLY_1: Byte   = 0x06
 private const val ID_OPEN_CONNECTION_REQUEST_2: Byte = 0x07
 private const val ID_OPEN_CONNECTION_REPLY_2: Byte   = 0x08
-private const val ID_ACK: Byte                     = 0xC0.toByte()
-private const val ID_NAK: Byte                     = 0xA0.toByte()
+private const val ID_ACK: Byte                       = 0xC0.toByte()
+private const val ID_NAK: Byte                       = 0xA0.toByte()
 
-// Bedrock game-layer IDs
-private const val BEDROCK_PACKET_LOGIN: Byte            = 0x01
-private const val BEDROCK_PACKET_PLAY_STATUS: Byte      = 0x02
-private const val BEDROCK_PACKET_RESOURCE_PACKS_INFO: Byte = 0x06
-private const val BEDROCK_PACKET_RESOURCE_PACK_STACK: Byte = 0x07
-private const val BEDROCK_PACKET_RESOURCE_PACK_RESPONSE: Byte = 0x08
-private const val BEDROCK_PACKET_TRANSFER: Byte         = 0x55
-
-// RakNet reliability types
-private const val RELIABILITY_UNRELIABLE      = 0
-private const val RELIABILITY_RELIABLE        = 2
+// ── RakNet reliability types ─────────────────────────────────────────────────
+private const val RELIABILITY_RELIABLE         = 2
 private const val RELIABILITY_RELIABLE_ORDERED = 3
 
 /**
- * Bedrock LAN Server — correct implementation.
+ * Bedrock LAN server — acts as a real (minimal) Bedrock server.
  *
- * ## How LAN discovery actually works
- * The Minecraft Bedrock client does NOT passively listen for broadcast packets.
- * Instead it sends an **UnconnectedPing** (0x01) to the LAN broadcast address and
- * waits for an **UnconnectedPong** (0x1C) response addressed back to it.
- * The original implementation only sent pong packets into the void which is why
- * the server never appeared in the LAN tab.
+ * ## How it works for consoles (Xbox / PS5 / Switch)
+ * Consoles cannot type custom server IPs. They discover servers only through
+ * the LAN tab. This class:
  *
- * ## Flow for consoles (Xbox / PS5 / Switch)
- * Consoles cannot enter custom server IPs, so this server handles the full
- * RakNet handshake and then sends a Bedrock **Transfer** packet (0x55) that
- * redirects the console to the real server address stored in the app.
+ *   1. Listens on UDP port 19132. When the console sends an UnconnectedPing it
+ *      replies directly (old code only broadcast blindly — that's why nothing
+ *      showed up in the LAN tab).
+ *   2. Completes the full RakNet handshake so the console can "connect".
+ *   3. Hands each connected client to a [BedrockSession] which:
+ *        • Performs ECDH encryption (Bedrock 1.20+ requires it).
+ *        • Serves locally stored resource packs over the session so the
+ *          console downloads and caches them.
+ *        • Sends a Bedrock Transfer packet (0x55) to redirect the console to
+ *          the real server address. Because the packs are already cached,
+ *          they apply immediately on the real server.
  *
- *   1. Console sends UnconnectedPing → we send UnconnectedPong → server appears
- *   2. Console sends OpenConnectionRequest1 → we reply → OpenConnectionReply1
- *   3. Console sends OpenConnectionRequest2 → we reply → OpenConnectionReply2
- *   4. Console sends ConnectionRequest (inside RakNet frame) → ConnectionRequestAccepted
- *   5. Console sends NewIncomingConnection → we send Transfer → console redirects
- *
- * ## Resource packs via LAN
- * After the Transfer the console connects directly to the real server, so packs
- * must be configured on that server. Injecting packs without a full MITM proxy
- * (which requires Bedrock encryption) is out of scope here.
- *
- * Protocol: 1026 ≈ Bedrock 1.26.30
- * (update PROTOCOL_VERSION when a new release ships — check wiki.vg/Bedrock_Protocol)
+ * ## Protocol version
+ * PROTOCOL_VERSION / GAME_VERSION control what is shown in the LAN tab.
+ * Update them when a new Bedrock release ships.
+ * Reference: wiki.vg/Bedrock_Protocol
  */
 @Singleton
-class LanBroadcaster @Inject constructor() {
+class LanBroadcaster @Inject constructor(
+    private val packRepository: ResourcePackRepository
+) {
 
     companion object {
-        /** Port Minecraft Bedrock uses for LAN discovery and connection. */
+        /** Bedrock default port. */
         const val BEDROCK_PORT = 19132
 
         /**
-         * RakNet "offline message ID" — must appear in ping/pong/open-connection
-         * packets. Acts as a magic cookie to distinguish RakNet traffic.
+         * RakNet "offline message ID" — magic cookie that appears in all
+         * pre-connection packets (ping, pong, open-connection).
          */
         val RAKNET_MAGIC: ByteArray = byteArrayOf(
             0x00, 0xff.toByte(), 0xff.toByte(), 0x00,
@@ -90,9 +77,9 @@ class LanBroadcaster @Inject constructor() {
         )
 
         /**
-         * Bedrock protocol version for 1.26.30 (estimated).
-         * Known: 748 = 1.21.50 | 980 = 1.26.0 est.
-         * Update this when a new Minecraft Bedrock release ships.
+         * Bedrock protocol number for 1.26.30 (estimated).
+         * Known anchors: 748 = 1.21.50.
+         * Update when the exact number for 1.26.30 is confirmed on wiki.vg.
          */
         private const val PROTOCOL_VERSION = 1026
         private const val GAME_VERSION     = "1.26.30"
@@ -100,21 +87,21 @@ class LanBroadcaster @Inject constructor() {
         private const val MAX_PACKET = 65536
     }
 
-    // A stable GUID that identifies this fake server across the session.
-    private val serverGuid: Long = System.nanoTime()
+    /** Stable server GUID for this session. */
+    private val serverGuid = System.nanoTime()
 
     // ─────────────────────────────────────────────────────────────────────────
     // Entry point
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Start the LAN server. Binds to UDP port 19132 and handles all incoming
-     * RakNet packets. Suspends until the coroutine is cancelled.
+     * Start the LAN server. Binds UDP port 19132 and handles all RakNet and
+     * Bedrock traffic until the coroutine is cancelled.
      *
-     * @param serverName Display name shown in the Minecraft LAN tab.
-     * @param serverIp   Real server IP to redirect consoles to.
+     * @param serverName Display name in the Minecraft LAN tab.
+     * @param serverIp   Real server to redirect consoles to after pack download.
      * @param serverPort Real server port (usually 19132).
-     * @param onError    Called with a message on unrecoverable error.
+     * @param onError    Called with a message on unrecoverable errors.
      */
     suspend fun startBroadcasting(
         serverName: String,
@@ -122,8 +109,15 @@ class LanBroadcaster @Inject constructor() {
         serverPort: Int,
         onError: (String) -> Unit = {}
     ) = withContext(Dispatchers.IO) {
+        // Load the currently enabled packs once at session start.
+        // Each console that connects will get a BedrockSession with this list.
+        val enabledPacks: List<LocalResourcePack> =
+            try { packRepository.enabledPacks.first() }
+            catch (e: Exception) { emptyList() }
+
+        Log.i(TAG, "Loaded ${enabledPacks.size} enabled pack(s) for LAN serving")
+
         var socket: DatagramSocket? = null
-        // Per-client state (sequence numbers etc.)
         val clients = HashMap<String, ClientState>()
 
         try {
@@ -132,7 +126,7 @@ class LanBroadcaster @Inject constructor() {
                 bind(InetSocketAddress(BEDROCK_PORT))
                 soTimeout = 150
             }
-            Log.i(TAG, "LAN server up on :$BEDROCK_PORT — '$serverName' → $serverIp:$serverPort")
+            Log.i(TAG, "LAN server up on :$BEDROCK_PORT '$serverName' → $serverIp:$serverPort")
 
             val buf = ByteArray(MAX_PACKET)
 
@@ -145,12 +139,15 @@ class LanBroadcaster @Inject constructor() {
                     val from = InetSocketAddress(pkt.address, pkt.port)
                     val key  = "${pkt.address.hostAddress}:${pkt.port}"
 
-                    dispatch(data, from, key, socket, serverName, serverIp, serverPort, clients)
-                } catch (_: SocketTimeoutException) { /* normal — no packet this cycle */ }
+                    dispatch(data, from, key, socket,
+                        serverName, serverIp, serverPort,
+                        enabledPacks, clients)
+
+                } catch (_: SocketTimeoutException) { /* normal */ }
             }
 
         } catch (e: Exception) {
-            Log.e(TAG, "Fatal: ${e.message}", e)
+            Log.e(TAG, "Fatal socket error: ${e.message}", e)
             onError("LAN server error: ${e.message}")
         } finally {
             socket?.close()
@@ -159,57 +156,68 @@ class LanBroadcaster @Inject constructor() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Packet dispatcher
+    // RakNet packet dispatcher
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun dispatch(
         data: ByteArray,
         from: InetSocketAddress,
-        key: String,
+        key:  String,
         sock: DatagramSocket,
         serverName: String,
-        serverIp: String,
+        serverIp:   String,
         serverPort: Int,
+        enabledPacks: List<LocalResourcePack>,
         clients: HashMap<String, ClientState>
     ) {
         if (data.isEmpty()) return
 
         when (data[0]) {
 
-            // ── LAN discovery ping ───────────────────────────────────────────
+            // ── LAN discovery — the critical fix ────────────────────────────
+            // Minecraft pings and waits for a direct reply; we were only
+            // broadcasting blindly which is why nothing showed in the LAN tab.
             ID_UNCONNECTED_PING -> {
-                if (data.size < 17 || !magicAt(data, 9)) return
+                if (data.size < 9) return
                 val pingTime = data.bigLong(1)
-                send(sock, from, pong(pingTime, serverName))
+                send(sock, from, unconnectedPong(pingTime, serverName))
                 Log.d(TAG, "Pong → $key")
             }
 
-            // ── RakNet open connection handshake ─────────────────────────────
+            // ── RakNet open-connection handshake ─────────────────────────────
             ID_OPEN_CONNECTION_REQUEST_1 -> {
                 if (!magicAt(data, 1)) return
-                // MTU = total UDP payload + 28 bytes overhead (IP+UDP headers)
-                val mtu = data.size + 28
+                val mtu = data.size + 28 // +28 for IP+UDP overhead
                 send(sock, from, openReply1(mtu))
-                Log.d(TAG, "OpenReply1 → $key, mtu=$mtu")
+                Log.d(TAG, "OpenReply1 → $key mtu=$mtu")
             }
 
             ID_OPEN_CONNECTION_REQUEST_2 -> {
                 if (!magicAt(data, 1)) return
-                // MTU is at offset 1+16 (magic) + serverAddress (7 bytes for IPv4) = 24
+                // MTU offset: 1(id) + 16(magic) + 7(server addr IPv4) = 24
                 val mtu = if (data.size >= 26) data.bigShort(24).toInt() and 0xFFFF else 1400
                 send(sock, from, openReply2(from, mtu))
-                clients[key] = ClientState()
-                Log.d(TAG, "OpenReply2 → $key, mtu=$mtu")
+
+                // Create per-client state and a full Bedrock session
+                val state = ClientState()
+                state.session = BedrockSession(
+                    sendBatch    = { batch -> send(sock, from, wrapReliable(batch, state)) },
+                    enabledPacks = enabledPacks,
+                    serverIp     = serverIp,
+                    serverPort   = serverPort
+                )
+                clients[key] = state
+                Log.d(TAG, "OpenReply2 → $key (session created, packs=${enabledPacks.size})")
             }
 
-            // ── ACK / NAK — acknowledge to keep RakNet happy but don't parse ─
-            ID_ACK, ID_NAK -> { /* no-op */ }
+            // ── RakNet ACK / NAK — keep the client happy ─────────────────────
+            ID_ACK, ID_NAK -> { /* acknowledged, nothing to do */ }
 
+            // ── RakNet data datagrams (IS_VALID bit set) ─────────────────────
             else -> {
-                // RakNet data datagrams have the IS_VALID bit set (0x80)
                 if (data[0].toInt() and 0x80 != 0 && data.size > 4) {
                     val state = clients.getOrPut(key) { ClientState() }
-                    handleDataDatagram(data, from, sock, serverIp, serverPort, state, key)
+                    handleDataDatagram(data, from, sock, serverIp, serverPort, state, key, clients)
                 }
             }
         }
@@ -220,33 +228,34 @@ class LanBroadcaster @Inject constructor() {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Parse RakNet reliability frames out of a data datagram and act on
-     * the inner Bedrock packet IDs.
+     * Parse RakNet reliability frames from a data datagram and act on the
+     * inner Bedrock packet IDs.
      *
      * Datagram layout:
-     *   [1 byte] flags (0x80–0x8F for data)
+     *   [1 byte] IS_VALID flags
      *   [3 bytes LE] sequence number
-     *   [frames…]
+     *   [frames …]
      *
-     * Each frame:
-     *   [1 byte]  reliability flags: (reliability << 5) | (hasSplit << 4)
-     *   [2 bytes BE] length of frame payload in bits
-     *   [3 bytes LE] reliable message index (if reliability ≥ 2)
-     *   [3 bytes LE] order index (if reliability == 1 | 3 | 4)
-     *   [1 byte]     order channel (if reliability == 1 | 3 | 4)
-     *   [10 bytes]   split info: count(4 BE)+id(2 BE)+index(4 BE) (if hasSplit)
+     * Frame header (RELIABLE_ORDERED):
+     *   [1 byte] (reliability << 5) | (hasSplit << 4)
+     *   [2 bytes BE] payload length in bits
+     *   [3 bytes LE] reliable message index
+     *   [3 bytes LE] order index
+     *   [1 byte] order channel
+     *   [opt 10 bytes] split info
      *   [payload]
      */
     private fun handleDataDatagram(
-        data: ByteArray,
-        from: InetSocketAddress,
-        sock: DatagramSocket,
-        serverIp: String,
+        data:       ByteArray,
+        from:       InetSocketAddress,
+        sock:       DatagramSocket,
+        serverIp:   String,
         serverPort: Int,
-        state: ClientState,
-        key: String
+        state:      ClientState,
+        key:        String,
+        clients:    HashMap<String, ClientState>
     ) {
-        // Send ACK for this datagram's sequence number so the client is happy
+        // ACK the incoming sequence number
         val seqNum = data.tripleLE(1)
         send(sock, from, buildAck(seqNum))
 
@@ -255,81 +264,106 @@ class LanBroadcaster @Inject constructor() {
         while (pos < data.size) {
             if (pos + 3 > data.size) break
 
-            val relByte    = data[pos].toInt() and 0xFF
+            val relByte     = data[pos].toInt() and 0xFF
             val reliability = relByte ushr 5
             val hasSplit    = (relByte ushr 4) and 1 == 1
             pos += 1
 
+            if (pos + 2 > data.size) break
             val lengthBits  = data.bigShort(pos).toInt() and 0xFFFF
             val lengthBytes = (lengthBits + 7) / 8
             pos += 2
 
-            // Skip per-reliability extra header bytes
-            if (reliability == RELIABILITY_RELIABLE || reliability == RELIABILITY_RELIABLE_ORDERED) {
+            // Skip reliability-specific extra header bytes
+            if (reliability == RELIABILITY_RELIABLE ||
+                reliability == RELIABILITY_RELIABLE_ORDERED) {
                 pos += 3 // reliable message index
             }
             if (reliability == RELIABILITY_RELIABLE_ORDERED) {
-                pos += 3 + 1 // order index + channel
+                pos += 4 // order index (3) + channel (1)
             }
-            if (hasSplit) pos += 10 // split count(4) + split id(2) + split index(4)
+            if (hasSplit) pos += 10 // count(4) + id(2) + index(4)
 
             if (pos + lengthBytes > data.size || lengthBytes <= 0) break
             val payload = data.copyOfRange(pos, pos + lengthBytes)
             pos += lengthBytes
-
             if (payload.isEmpty()) continue
 
-            when (payload[0]) {
+            onFrame(payload, from, sock, serverIp, serverPort, state, key, clients)
+        }
+    }
 
-                // ── ConnectionRequest (0x09) ─────────────────────────────────
-                0x09.toByte() -> {
-                    val requestTime = if (payload.size >= 9) payload.bigLong(1) else 0L
-                    val accepted    = connectionRequestAccepted(from, requestTime, state)
-                    send(sock, from, accepted)
-                    Log.d(TAG, "ConnectionRequestAccepted → $key")
-                }
+    private fun onFrame(
+        payload:   ByteArray,
+        from:      InetSocketAddress,
+        sock:      DatagramSocket,
+        serverIp:  String,
+        serverPort:Int,
+        state:     ClientState,
+        key:       String,
+        clients:   HashMap<String, ClientState>
+    ) {
+        when (payload[0]) {
 
-                // ── NewIncomingConnection (0x13) ─────────────────────────────
-                // Client is now fully connected — send Transfer to redirect
-                0x13.toByte() -> {
-                    val transfer = transferPacket(serverIp, serverPort, state)
-                    send(sock, from, transfer)
-                    Log.i(TAG, "Transfer sent → $key redirecting to $serverIp:$serverPort")
-                }
-
-                // ── ConnectedPing (0x00) — keep-alive reply ──────────────────
-                0x00.toByte() -> {
-                    val pingTime   = if (payload.size >= 9) payload.bigLong(1) else 0L
-                    val pongPayload = ByteArray(17).also { b ->
-                        b[0] = 0x03 // ConnectedPong
-                        putLong(b, 1, pingTime)
-                        putLong(b, 9, System.currentTimeMillis())
-                    }
-                    send(sock, from, wrapReliable(pongPayload, state))
-                }
-
-                // ── Bedrock batch packet (0xFE) ──────────────────────────────
-                // Sent when the client starts its Bedrock Login flow.
-                // We respond immediately with Transfer (before encryption).
-                0xFE.toByte() -> {
-                    val transfer = transferPacket(serverIp, serverPort, state)
-                    send(sock, from, transfer)
-                    Log.i(TAG, "Batch received — Transfer sent → $key to $serverIp:$serverPort")
-                }
-
-                // ── Disconnect (0x15) ────────────────────────────────────────
-                0x15.toByte() -> Log.d(TAG, "Client disconnected: $key")
+            // ── ConnectionRequest (0x09) ─────────────────────────────────────
+            0x09.toByte() -> {
+                val requestTime = if (payload.size >= 9) payload.bigLong(1) else 0L
+                send(sock, from, connectionRequestAccepted(from, requestTime, state))
+                Log.d(TAG, "ConnectionRequestAccepted → $key")
             }
+
+            // ── NewIncomingConnection (0x13) ─────────────────────────────────
+            // RakNet session is fully open. The BedrockSession now drives
+            // everything: Login → encryption → packs → Transfer.
+            0x13.toByte() -> {
+                Log.d(TAG, "NewIncomingConnection from $key — Bedrock session active")
+                // Nothing to send here; we wait for the client's Login batch.
+            }
+
+            // ── Bedrock batch packet (0xFE) ──────────────────────────────────
+            // Route to the BedrockSession which handles Login, encryption,
+            // resource pack exchange, and finally the Transfer.
+            0xFE.toByte() -> {
+                state.session?.handleBatch(payload) ?: run {
+                    // Session not yet created (e.g. connection raced) — just
+                    // create a minimal session and handle the batch now.
+                    val session = BedrockSession(
+                        sendBatch    = { batch -> send(sock, from, wrapReliable(batch, state)) },
+                        enabledPacks = emptyList(),
+                        serverIp     = serverIp,
+                        serverPort   = serverPort
+                    )
+                    state.session = session
+                    clients[key] = state
+                    session.handleBatch(payload)
+                }
+            }
+
+            // ── ConnectedPing (0x00) ─────────────────────────────────────────
+            0x00.toByte() -> {
+                if (payload.size < 9) return
+                val pingTime = payload.bigLong(1)
+                val pong = ByteArray(17).also { b ->
+                    b[0] = 0x03
+                    putLong(b, 1, pingTime)
+                    putLong(b, 9, System.currentTimeMillis())
+                }
+                send(sock, from, wrapReliable(pong, state))
+            }
+
+            // ── Disconnect (0x15) ────────────────────────────────────────────
+            0x15.toByte() -> Log.d(TAG, "Client disconnected: $key")
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Packet builders
+    // RakNet packet builders
     // ─────────────────────────────────────────────────────────────────────────
 
-    /** UnconnectedPong (0x1C) — response to a LAN discovery ping. */
-    private fun pong(pingTime: Long, serverName: String): ByteArray {
-        val motd = "MCPE;$serverName;$PROTOCOL_VERSION;$GAME_VERSION;0;20;$serverGuid;FreeConnect;Survival;1;$BEDROCK_PORT;$BEDROCK_PORT;"
+    /** UnconnectedPong (0x1C) — sent directly to the pinging client. */
+    private fun unconnectedPong(pingTime: Long, serverName: String): ByteArray {
+        val motd = "MCPE;$serverName;$PROTOCOL_VERSION;$GAME_VERSION;" +
+                   "0;20;$serverGuid;FreeConnect;Survival;1;$BEDROCK_PORT;$BEDROCK_PORT;"
         val motdBytes = motd.toByteArray(Charsets.UTF_8)
         return ByteBuffer.allocate(1 + 8 + 8 + 16 + 2 + motdBytes.size).apply {
             put(ID_UNCONNECTED_PONG)
@@ -341,130 +375,91 @@ class LanBroadcaster @Inject constructor() {
         }.array()
     }
 
-    /** OpenConnectionReply1 (0x06) */
+    /** OpenConnectionReply1 (0x06). */
     private fun openReply1(mtu: Int): ByteArray =
         ByteBuffer.allocate(1 + 16 + 8 + 1 + 2).apply {
             put(ID_OPEN_CONNECTION_REPLY_1)
             put(RAKNET_MAGIC)
             putLong(serverGuid)
-            put(0x00)              // no security
+            put(0x00)               // no security
             putShort(mtu.toShort())
         }.array()
 
-    /** OpenConnectionReply2 (0x08) */
+    /** OpenConnectionReply2 (0x08). */
     private fun openReply2(client: InetSocketAddress, mtu: Int): ByteArray =
         ByteBuffer.allocate(1 + 16 + 8 + 7 + 2 + 1).apply {
             put(ID_OPEN_CONNECTION_REPLY_2)
             put(RAKNET_MAGIC)
             putLong(serverGuid)
-            putRakNetAddress(client)
+            putRakNetAddr(client)
             putShort(mtu.toShort())
-            put(0x00)              // no encryption
+            put(0x00)               // no encryption at RakNet layer
         }.array()
 
     /**
-     * ConnectionRequestAccepted (0x10) wrapped in a RakNet reliable frame.
+     * ConnectionRequestAccepted (0x10) wrapped in a RakNet reliable datagram.
      *
-     * Payload layout:
-     *   [1]  packet ID 0x10
+     * Payload:
+     *   [1]  0x10
      *   [7]  client IPv4 address
      *   [2]  system index (0)
-     *   [70] 10 × placeholder system addresses
+     *   [70] 10 × placeholder addresses
      *   [8]  ping request time
      *   [8]  current time
      */
     private fun connectionRequestAccepted(
-        client: InetSocketAddress,
+        client:      InetSocketAddress,
         requestTime: Long,
-        state: ClientState
+        state:       ClientState
     ): ByteArray {
         val payload = ByteBuffer.allocate(1 + 7 + 2 + 70 + 8 + 8).apply {
             put(0x10)
-            putRakNetAddress(client)
+            putRakNetAddr(client)
             putShort(0)
-            repeat(10) { putRakNetAddress(InetSocketAddress("0.0.0.0", 0)) }
+            repeat(10) { putRakNetAddr(InetSocketAddress("0.0.0.0", 0)) }
             putLong(requestTime)
             putLong(System.currentTimeMillis())
         }.rawBytes()
         return wrapReliable(payload, state)
     }
 
-    /**
-     * Build a Bedrock Transfer packet wrapped in an unencrypted batch,
-     * then wrapped in a RakNet reliable datagram.
-     *
-     * Bedrock Batch (0xFE):
-     *   [1 byte]  0xFE
-     *   [zlib of: varint(length) | 0x55 | LE-short(ip len) | ip bytes | LE-short(port)]
-     */
-    private fun transferPacket(ip: String, port: Int, state: ClientState): ByteArray {
-        val ipBytes = ip.toByteArray(Charsets.UTF_8)
-
-        // Build raw game packet bytes for Transfer (0x55)
-        val gamePacket = ByteBuffer.allocate(1 + 2 + ipBytes.size + 2).apply {
-            order(ByteOrder.LITTLE_ENDIAN)
-            put(BEDROCK_PACKET_TRANSFER)
-            putShort(ipBytes.size.toShort())
-            put(ipBytes)
-            putShort(port.toShort())
-        }.rawBytes()
-
-        // Prefix with varint length (Bedrock batch inner format)
-        val lenVarint = encodeUnsignedVarInt(gamePacket.size)
-        val batchInner = lenVarint + gamePacket
-
-        // Compress with zlib (deflate, level 6)
-        val compressed = zlibDeflate(batchInner)
-
-        // Build batch outer: 0xFE + compressed
-        val batchOuter = ByteArray(1 + compressed.size)
-        batchOuter[0] = 0xFE.toByte()
-        compressed.copyInto(batchOuter, 1)
-
-        return wrapReliable(batchOuter, state)
-    }
-
-    /** ACK packet for a given sequence number. */
+    /** ACK for a given sequence number. */
     private fun buildAck(seqNum: Int): ByteArray =
-        ByteBuffer.allocate(6).apply {
+        ByteBuffer.allocate(7).apply {
             put(ID_ACK)
-            putShort(1)            // record count = 1
-            put(0x01)              // is single
-            put((seqNum and 0xFF).toByte())
-            put(((seqNum shr 8) and 0xFF).toByte())
-            put(((seqNum shr 16) and 0xFF).toByte())
+            putShort(1)                      // record count
+            put(0x01)                        // is single record
+            put3LE(seqNum)
         }.array()
 
     // ─────────────────────────────────────────────────────────────────────────
-    // RakNet framing helpers
+    // RakNet framing
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
      * Wrap [payload] in a RakNet RELIABLE_ORDERED data datagram.
      *
-     * Datagram: [0x84][seqNum 3 LE][frame…]
-     * Frame:    [reliability byte][length 2 BE][reliableIdx 3 LE][orderIdx 3 LE][channel 1][payload]
+     * Datagram: [0x84][seqNum 3LE][frame…]
+     * Frame:    [0x60][len 2BE][reliableIdx 3LE][orderIdx 3LE][channel][payload]
      */
-    private fun wrapReliable(payload: ByteArray, state: ClientState): ByteArray {
-        val reliableIdx = state.reliableIdx++
-        val orderIdx    = state.orderIdx++
-        val seqNum      = state.seqNum++
-
-        val frameFlagsByte = (RELIABILITY_RELIABLE_ORDERED shl 5).toByte() // 0x60
-        val lengthBits     = (payload.size * 8).toShort()
+    fun wrapReliable(payload: ByteArray, state: ClientState): ByteArray {
+        val rIdx  = state.reliableIdx++
+        val oIdx  = state.orderIdx++
+        val seq   = state.seqNum++
+        val lenBits = (payload.size * 8).toShort()
 
         val frame = ByteBuffer.allocate(1 + 2 + 3 + 3 + 1 + payload.size).apply {
-            put(frameFlagsByte)
-            putShort(lengthBits)
-            put3LE(reliableIdx)
-            put3LE(orderIdx)
-            put(0x00)              // order channel 0
+            put((RELIABILITY_RELIABLE_ORDERED shl 5).toByte()) // 0x60
+            putShort(lenBits)
+            put3LE(rIdx)
+            put3LE(oIdx)
+            put(0x00) // channel 0
             put(payload)
         }.rawBytes()
 
         return ByteBuffer.allocate(1 + 3 + frame.size).apply {
-            put(0x84.toByte())     // IS_VALID | IS_CONTINUOUS_SEND
-            put3LE(seqNum)
+            put(0x84.toByte()) // IS_VALID | IS_CONTINUOUS_SEND
+            put3LE(seq)
             put(frame)
         }.rawBytes()
     }
@@ -473,10 +468,10 @@ class LanBroadcaster @Inject constructor() {
     // Byte / buffer helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /** Write a RakNet IPv4 address: [0x04][~ip bytes][port 2 BE]. */
-    private fun ByteBuffer.putRakNetAddress(addr: InetSocketAddress) {
+    /** RakNet IPv4 address: [0x04][~ip bytes (XOR 0xFF)][port 2BE]. */
+    private fun ByteBuffer.putRakNetAddr(addr: InetSocketAddress) {
         put(0x04)
-        val ip = addr.address?.address ?: byteArrayOf(0, 0, 0, 0)
+        val ip = addr.address?.address ?: ByteArray(4)
         if (ip.size == 4) ip.forEach { put((it.toInt() xor 0xFF).toByte()) }
         else repeat(4) { put(0x00) }
         putShort(addr.port.toShort())
@@ -488,24 +483,19 @@ class LanBroadcaster @Inject constructor() {
         put(((v shr 16) and 0xFF).toByte())
     }
 
-    /** Return a copy of the buffer's content up to the current position. */
-    private fun ByteBuffer.rawBytes(): ByteArray = array().copyOf(position())
+    private fun ByteBuffer.rawBytes() = array().copyOf(position())
 
-    /** Check whether [RAKNET_MAGIC] appears at [offset] in [data]. */
     private fun magicAt(data: ByteArray, offset: Int): Boolean {
         if (data.size < offset + 16) return false
         return RAKNET_MAGIC.indices.all { data[offset + it] == RAKNET_MAGIC[it] }
     }
 
-    /** Read 8 bytes big-endian as Long starting at [offset]. */
     private fun ByteArray.bigLong(offset: Int) =
         ByteBuffer.wrap(this, offset, 8).order(ByteOrder.BIG_ENDIAN).long
 
-    /** Read 2 bytes big-endian as Short starting at [offset]. */
     private fun ByteArray.bigShort(offset: Int) =
         ByteBuffer.wrap(this, offset, 2).order(ByteOrder.BIG_ENDIAN).short
 
-    /** Read 3 bytes little-endian as Int starting at [offset]. */
     private fun ByteArray.tripleLE(offset: Int) =
         (this[offset].toInt() and 0xFF) or
         ((this[offset + 1].toInt() and 0xFF) shl 8) or
@@ -515,51 +505,23 @@ class LanBroadcaster @Inject constructor() {
         for (i in 0..7) buf[offset + i] = ((v ushr ((7 - i) * 8)) and 0xFF).toByte()
     }
 
-    /** Encode an unsigned varint (LEB128). Used in Bedrock batch packets. */
-    private fun encodeUnsignedVarInt(value: Int): ByteArray {
-        var v = value
-        val out = mutableListOf<Byte>()
-        do {
-            var b = v and 0x7F
-            v = v ushr 7
-            if (v != 0) b = b or 0x80
-            out.add(b.toByte())
-        } while (v != 0)
-        return out.toByteArray()
-    }
-
-    /** Deflate (zlib) compress [data] at level 6. */
-    private fun zlibDeflate(data: ByteArray): ByteArray {
-        val deflater = Deflater(6)
-        deflater.setInput(data)
-        deflater.finish()
-        val out = ByteArrayOutputStream()
-        val tmp = ByteArray(1024)
-        while (!deflater.finished()) {
-            val n = deflater.deflate(tmp)
-            out.write(tmp, 0, n)
-        }
-        deflater.end()
-        return out.toByteArray()
-    }
-
-    /** Send a UDP datagram and swallow any IO error (logged only). */
     private fun send(sock: DatagramSocket, to: InetSocketAddress, data: ByteArray) {
-        try {
-            sock.send(DatagramPacket(data, data.size, to.address, to.port))
-        } catch (e: Exception) {
-            Log.w(TAG, "send error to $to: ${e.message}")
-        }
+        try { sock.send(DatagramPacket(data, data.size, to.address, to.port)) }
+        catch (e: Exception) { Log.w(TAG, "send error: ${e.message}") }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Per-client state
     // ─────────────────────────────────────────────────────────────────────────
 
-    /** Tracks outgoing sequence numbers for one connected client. */
-    private data class ClientState(
+    /**
+     * Tracks RakNet sequence numbers and the Bedrock session for one client.
+     * All fields are mutated on the single IO-thread receive loop — no sync needed.
+     */
+    data class ClientState(
         var seqNum:      Int = 0,
         var reliableIdx: Int = 0,
-        var orderIdx:    Int = 0
+        var orderIdx:    Int = 0,
+        var session:     BedrockSession? = null
     )
 }
