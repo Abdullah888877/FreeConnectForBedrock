@@ -52,7 +52,7 @@ class BedrockProxy @Inject constructor() {
         private const val ID_UNCONNECTED_PING_OPEN: Byte = 0x02
         private const val MIN_PING_SIZE                  = 25
         private const val PROTOCOL_VERSION               = 975
-        private const val GAME_VERSION                   = "1.21.50"
+        private const val GAME_VERSION                   = "1.26.30"
     }
 
     private data class Session(
