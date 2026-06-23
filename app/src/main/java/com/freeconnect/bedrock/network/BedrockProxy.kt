@@ -1,7 +1,6 @@
 package com.freeconnect.bedrock.network
 
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -21,49 +20,75 @@ private const val TAG = "BedrockProxy"
  * UDP proxy that makes a remote Minecraft Bedrock server reachable as a
  * local LAN endpoint.
  *
- * How it works:
- *   1. [LanBroadcaster] advertises this proxy's port ([PROXY_PORT]) in the
- *      LAN MOTD so Minecraft thinks the server is on the local network.
- *   2. Minecraft connects to <device-IP>:[PROXY_PORT].
- *   3. This proxy receives each UDP packet from Minecraft, forwards it to
- *      the real remote server, and relays the response back — transparently.
- *
- * Session management:
- *   Each distinct (clientAddress, clientPort) pair gets its own outbound
- *   [DatagramSocket] so packets are correctly demultiplexed. Sessions that
- *   are idle for [SESSION_TIMEOUT_MS] are cleaned up automatically.
+ * Key fixes vs naïve blind-forward approach:
+ *  1. Intercepts RakNet ID_UNCONNECTED_PING / PING_OPEN on 19133 and
+ *     responds locally with the same serverId/GUID used in the LAN
+ *     advertisement.  Forwarding pings to the real server returns the
+ *     server's own GUID, which mismatches the LAN discovery GUID and
+ *     causes Minecraft to show "Your internet is experiencing…".
+ *  2. Uses ConcurrentHashMap.computeIfAbsent (atomic) instead of
+ *     getOrPut (not atomic) to prevent duplicate sessions under burst traffic.
+ *  3. BUFFER_SIZE bumped to 65535 — max UDP datagram, avoids truncation of
+ *     large RakNet fragments during map downloads.
  */
 @Singleton
 class BedrockProxy @Inject constructor() {
 
     companion object {
-        /** Local port Minecraft will connect to after seeing the LAN advertisement. */
+        /** Local port Minecraft connects to after seeing the LAN advertisement. */
         const val PROXY_PORT = 19133
 
-        private const val BUFFER_SIZE = 4096
+        private const val BUFFER_SIZE       = 65535
         private const val SOCKET_TIMEOUT_MS = 500
         private const val SESSION_TIMEOUT_MS = 30_000L
+
+        private val RAKNET_MAGIC = byteArrayOf(
+            0x00, 0xff.toByte(), 0xff.toByte(), 0x00,
+            0xfe.toByte(), 0xfe.toByte(), 0xfe.toByte(), 0xfe.toByte(),
+            0xfd.toByte(), 0xfd.toByte(), 0xfd.toByte(), 0xfd.toByte(),
+            0x12, 0x34, 0x56, 0x78
+        )
+        private const val ID_UNCONNECTED_PING: Byte      = 0x01
+        private const val ID_UNCONNECTED_PING_OPEN: Byte = 0x02
+        private const val MIN_PING_SIZE                  = 25
+        private const val PROTOCOL_VERSION               = 975
+        private const val GAME_VERSION                   = "1.21.50"
     }
 
-    /** Holds the outbound socket and last-activity timestamp for one client session. */
     private data class Session(
         val outSocket: DatagramSocket,
         @Volatile var lastActivity: Long = System.currentTimeMillis()
     )
 
+    private fun buildPongPacket(serverName: String, serverId: Long, pingTime: Long): ByteArray {
+        val timeBytes = ByteArray(8) { i -> ((pingTime shr ((7 - i) * 8)) and 0xFF).toByte() }
+        val guidBytes = ByteArray(8) { i -> ((serverId shr ((7 - i) * 8)) and 0xFF).toByte() }
+        val motd      = "MCPE;${serverName};${PROTOCOL_VERSION};${GAME_VERSION};0;20;${serverId};FreeConnect;Survival;1;${PROXY_PORT};${PROXY_PORT};"
+        val motdBytes = motd.toByteArray(Charsets.UTF_8)
+        val lenBytes  = byteArrayOf(((motdBytes.size shr 8) and 0xFF).toByte(), (motdBytes.size and 0xFF).toByte())
+        return byteArrayOf(0x1C) + timeBytes + RAKNET_MAGIC + guidBytes + lenBytes + motdBytes
+    }
+
+    private fun extractPingTime(buf: ByteArray): Long {
+        var t = 0L; for (i in 0..7) t = (t shl 8) or (buf[1 + i].toLong() and 0xFF); return t
+    }
+
     /**
-     * Start the proxy, forwarding all traffic between local Minecraft clients and
+     * Start the proxy, forwarding traffic between local Minecraft clients and
      * the remote Bedrock server.
-     *
-     * This suspending function blocks until the coroutine scope is cancelled.
      *
      * @param remoteIp    IP or hostname of the real Bedrock server.
      * @param remotePort  Port of the real Bedrock server.
-     * @param onError     Called with a message on unrecoverable startup failure.
+     * @param serverName  Display name — used in ping responses to match LAN advertisement.
+     * @param serverId    GUID — MUST match the value used in [LanBroadcaster] so pings
+     *                    on this port return the same identity Minecraft saw during discovery.
+     * @param onError     Called on unrecoverable startup failure.
      */
     suspend fun start(
         remoteIp: String,
         remotePort: Int,
+        serverName: String = "Minecraft Server",
+        serverId: Long = System.currentTimeMillis(),
         onError: (String) -> Unit = {}
     ) = withContext(Dispatchers.IO) {
         val sessions = ConcurrentHashMap<String, Session>()
@@ -76,10 +101,9 @@ class BedrockProxy @Inject constructor() {
                 soTimeout = SOCKET_TIMEOUT_MS
             }
             val remoteAddress = InetAddress.getByName(remoteIp)
+            Log.i(TAG, "Proxy started on :$PROXY_PORT → $remoteIp:$remotePort  guid=$serverId")
 
-            Log.i(TAG, "Proxy started on :$PROXY_PORT → $remoteIp:$remotePort")
-
-            val buffer = ByteArray(BUFFER_SIZE)
+            val buffer     = ByteArray(BUFFER_SIZE)
             val recvPacket = DatagramPacket(buffer, buffer.size)
 
             while (isActive) {
@@ -90,14 +114,30 @@ class BedrockProxy @Inject constructor() {
                     val clientAddr = recvPacket.address
                     val clientPort = recvPacket.port
                     val clientKey  = "$clientAddr:$clientPort"
-                    val payload    = recvPacket.data.copyOf(recvPacket.length)
+                    val len        = recvPacket.length
+                    val id         = buffer[0]
 
-                    // Get or create a session for this client
-                    val session = sessions.getOrPut(clientKey) {
-                        val outSock = DatagramSocket().apply { soTimeout = SOCKET_TIMEOUT_MS }
-                        val newSession = Session(outSock)
+                    // ── Ping interception ────────────────────────────────────────────────
+                    // Reply locally so Minecraft sees the same GUID as the LAN advertisement.
+                    // If we forwarded to the real server its GUID would differ → "internet" error.
+                    if ((id == ID_UNCONNECTED_PING || id == ID_UNCONNECTED_PING_OPEN) && len >= MIN_PING_SIZE) {
+                        val pong = buildPongPacket(serverName, serverId, extractPingTime(buffer))
+                        listenSocket?.send(DatagramPacket(pong, pong.size, clientAddr, clientPort))
+                        Log.d(TAG, "Pong → ${clientAddr.hostAddress}:$clientPort")
+                        continue
+                    }
 
-                        // Coroutine: relay remote → client
+                    val payload = buffer.copyOf(len)
+
+                    // ── Atomic session creation ──────────────────────────────────────────
+                    // computeIfAbsent is atomic; getOrPut on ConcurrentHashMap is NOT.
+                    var isNew = false
+                    val session = sessions.computeIfAbsent(clientKey) {
+                        isNew = true
+                        Session(DatagramSocket().apply { soTimeout = SOCKET_TIMEOUT_MS })
+                    }
+
+                    if (isNew) {
                         launch(Dispatchers.IO) {
                             val respBuf    = ByteArray(BUFFER_SIZE)
                             val respPacket = DatagramPacket(respBuf, respBuf.size)
@@ -105,46 +145,36 @@ class BedrockProxy @Inject constructor() {
                                 while (isActive && sessions.containsKey(clientKey)) {
                                     try {
                                         respPacket.length = respBuf.size
-                                        newSession.outSocket.receive(respPacket)
-                                        newSession.lastActivity = System.currentTimeMillis()
-
-                                        val fwd = DatagramPacket(
+                                        session.outSocket.receive(respPacket)
+                                        session.lastActivity = System.currentTimeMillis()
+                                        listenSocket?.send(DatagramPacket(
                                             respPacket.data.copyOf(respPacket.length),
-                                            respPacket.length,
-                                            clientAddr,
-                                            clientPort
-                                        )
-                                        listenSocket?.send(fwd)
+                                            respPacket.length, clientAddr, clientPort
+                                        ))
                                     } catch (e: SocketTimeoutException) {
-                                        // Expire idle sessions
-                                        if (System.currentTimeMillis() - newSession.lastActivity > SESSION_TIMEOUT_MS) {
+                                        if (System.currentTimeMillis() - session.lastActivity > SESSION_TIMEOUT_MS) {
                                             Log.d(TAG, "Session expired: $clientKey")
                                             sessions.remove(clientKey)?.outSocket?.close()
                                             break
                                         }
                                     } catch (e: Exception) {
-                                        if (isActive) Log.w(TAG, "Remote→client error ($clientKey): ${e.message}")
+                                        if (isActive) Log.w(TAG, "Remote→client ($clientKey): ${e.message}")
                                         sessions.remove(clientKey)?.outSocket?.close()
                                         break
                                     }
                                 }
                             } catch (e: Exception) {
-                                Log.w(TAG, "Session relay ended ($clientKey): ${e.message}")
+                                Log.w(TAG, "Relay ended ($clientKey): ${e.message}")
                             }
                         }
-
                         Log.d(TAG, "New session: $clientKey")
-                        newSession
                     }
 
                     session.lastActivity = System.currentTimeMillis()
-
-                    // Forward client → remote
-                    val fwd = DatagramPacket(payload, payload.size, remoteAddress, remotePort)
-                    session.outSocket.send(fwd)
+                    session.outSocket.send(DatagramPacket(payload, payload.size, remoteAddress, remotePort))
 
                 } catch (e: SocketTimeoutException) {
-                    // Expected — lets us check isActive
+                    // Expected — lets isActive be checked between receives
                 } catch (e: Exception) {
                     if (isActive) Log.w(TAG, "Accept error: ${e.message}")
                 }
@@ -156,7 +186,7 @@ class BedrockProxy @Inject constructor() {
             listenSocket?.close()
             sessions.values.forEach { runCatching { it.outSocket.close() } }
             sessions.clear()
-            Log.i(TAG, "Proxy stopped for $remoteIp:$remotePort")
+            Log.i(TAG, "Proxy stopped")
         }
     }
 }
