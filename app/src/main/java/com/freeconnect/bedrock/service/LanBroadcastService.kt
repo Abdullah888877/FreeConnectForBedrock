@@ -13,14 +13,16 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.freeconnect.bedrock.MainActivity
 import com.freeconnect.bedrock.R
-import com.freeconnect.bedrock.network.BedrockProxy
+import com.freeconnect.bedrock.data.resourcepack.ResourcePackRepository
 import com.freeconnect.bedrock.network.LanBroadcaster
+import com.freeconnect.bedrock.network.RakNetServer
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -29,21 +31,26 @@ private const val TAG = "LanBroadcastService"
 /**
  * Foreground service that:
  *   1. Acquires a WifiManager.MulticastLock so Android delivers incoming UDP
- *      broadcast packets to our socket (critical on Samsung/Xiaomi/Oppo etc.).
- *   2. Runs LanBroadcaster — dual-mode LAN discovery on port 19132.
- *   3. Runs BedrockProxy — UDP tunnel on port 19133 to the real remote server.
+ *      broadcast packets (critical on Samsung/Xiaomi/Oppo etc.).
+ *   2. Runs [LanBroadcaster] — dual-mode LAN discovery on port 19132.
+ *   3. Runs [RakNetServer] — full RakNet handshake + [BedrockSession] for
+ *      resource-pack delivery and Transfer on port 19133.
+ *
+ * Resource-pack flow (no proxy needed):
+ *   Client → [RakNetServer] (19133) → login + pack download → Transfer →
+ *   Client connects DIRECTLY to the real Bedrock server.
  */
 @AndroidEntryPoint
 class LanBroadcastService : Service() {
 
     @Inject lateinit var lanBroadcaster: LanBroadcaster
-    @Inject lateinit var bedrockProxy: BedrockProxy
+    @Inject lateinit var rakNetServer: RakNetServer
+    @Inject lateinit var resourcePackRepository: ResourcePackRepository
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val serviceScope     = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var broadcasterJob: Job? = null
-    private var proxyJob: Job? = null
+    private var serverJob: Job?      = null
 
-    /** Held while broadcasting; prevents the OS from silently dropping UDP broadcasts. */
     private var multicastLock: WifiManager.MulticastLock? = null
 
     companion object {
@@ -76,8 +83,6 @@ class LanBroadcastService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        // Acquire multicast lock — many Android OEMs silently drop incoming UDP
-        // broadcast packets without this, making LAN discovery impossible.
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wm.createMulticastLock(MULTICAST_TAG).also {
             it.setReferenceCounted(true)
@@ -96,29 +101,32 @@ class LanBroadcastService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification(serverName, serverIp, serverPort))
 
         broadcasterJob?.cancel()
-        proxyJob?.cancel()
+        serverJob?.cancel()
 
-        // Single shared GUID — LanBroadcaster and BedrockProxy MUST use the same
-        // serverId so Minecraft receives identical GUIDs during discovery (port 19132)
-        // and during connection (port 19133).  A mismatch causes "internet" errors.
+        // Single shared GUID — LanBroadcaster and RakNetServer MUST advertise and
+        // respond with the same serverId so Minecraft sees a consistent identity.
         val serverId = System.currentTimeMillis()
 
         broadcasterJob = serviceScope.launch {
             lanBroadcaster.startBroadcasting(
                 serverName  = serverName,
                 serverId    = serverId,
-                connectPort = BedrockProxy.PROXY_PORT,
-                onError     = { err -> Log.e(TAG, "Broadcaster error: $err") }
+                connectPort = RakNetServer.SERVER_PORT,
+                onError     = { err -> Log.e(TAG, "Broadcaster: $err") }
             )
         }
 
-        proxyJob = serviceScope.launch {
-            bedrockProxy.start(
-                remoteIp   = serverIp,
-                remotePort = serverPort,
-                serverName = serverName,
-                serverId   = serverId,
-                onError    = { err -> Log.e(TAG, "Proxy error: $err") }
+        serverJob = serviceScope.launch {
+            // Load currently-enabled packs (suspend, waits for one DB emission)
+            val enabledPacks = resourcePackRepository.enabledPacks.first()
+            Log.i(TAG, "Starting RakNet server with ${enabledPacks.size} enabled pack(s)")
+            rakNetServer.start(
+                serverId     = serverId,
+                serverName   = serverName,
+                enabledPacks = enabledPacks,
+                remoteIp     = serverIp,
+                remotePort   = serverPort,
+                onError      = { err -> Log.e(TAG, "RakNet: $err") }
             )
         }
 
@@ -128,7 +136,7 @@ class LanBroadcastService : Service() {
 
     override fun onDestroy() {
         broadcasterJob?.cancel()
-        proxyJob?.cancel()
+        serverJob?.cancel()
         serviceScope.cancel()
         multicastLock?.let { if (it.isHeld) { it.release(); Log.i(TAG, "MulticastLock released") } }
         super.onDestroy()
@@ -151,7 +159,7 @@ class LanBroadcastService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Broadcasting: ${name}")
-            .setContentText("Relaying ${ip}:${port} → LAN:${BedrockProxy.PROXY_PORT}")
+            .setContentText("Packs → LAN:${RakNetServer.SERVER_PORT} → ${ip}:${port}")
             .setSmallIcon(android.R.drawable.ic_menu_share)
             .setContentIntent(openI)
             .addAction(android.R.drawable.ic_media_pause, "Stop", stopI)
