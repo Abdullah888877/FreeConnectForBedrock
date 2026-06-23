@@ -98,9 +98,15 @@ class LanBroadcastService : Service() {
         broadcasterJob?.cancel()
         proxyJob?.cancel()
 
+        // Single shared GUID — LanBroadcaster and BedrockProxy MUST use the same
+        // serverId so Minecraft receives identical GUIDs during discovery (port 19132)
+        // and during connection (port 19133).  A mismatch causes "internet" errors.
+        val serverId = System.currentTimeMillis()
+
         broadcasterJob = serviceScope.launch {
             lanBroadcaster.startBroadcasting(
                 serverName  = serverName,
+                serverId    = serverId,
                 connectPort = BedrockProxy.PROXY_PORT,
                 onError     = { err -> Log.e(TAG, "Broadcaster error: $err") }
             )
@@ -110,6 +116,8 @@ class LanBroadcastService : Service() {
             bedrockProxy.start(
                 remoteIp   = serverIp,
                 remotePort = serverPort,
+                serverName = serverName,
+                serverId   = serverId,
                 onError    = { err -> Log.e(TAG, "Proxy error: $err") }
             )
         }
