@@ -47,7 +47,7 @@ class LanBroadcaster @Inject constructor() {
         )
 
         private const val PROTOCOL_VERSION               = 975
-        private const val GAME_VERSION                   = "1.26.20"
+        private const val GAME_VERSION                   = "1.26.30"
         private const val ID_UNCONNECTED_PING: Byte      = 0x01
         private const val ID_UNCONNECTED_PING_OPEN: Byte = 0x02
         private const val MIN_PING_SIZE                  = 25
