@@ -89,10 +89,10 @@ class LanBroadcaster @Inject constructor() {
 
     suspend fun startBroadcasting(
         serverName: String,
+        serverId: Long = System.currentTimeMillis(),
         connectPort: Int = BedrockProxy.PROXY_PORT,
         onError: (String) -> Unit = {}
     ) = withContext(Dispatchers.IO) {
-        val serverId = System.currentTimeMillis()
         var socket: DatagramSocket? = null
         try {
             socket = DatagramSocket(null).apply {
